@@ -23,8 +23,10 @@ def sanitize_filename(value: str) -> str:
     return cleaned or f"markitdown_{timestamp()}"
 
 
-def default_output_name() -> str:
-    return f"markitdown_{timestamp()}.md"
+def default_output_name(source: Path | None = None) -> str:
+    if source is None:
+        return f"markitdown_{timestamp()}.md"
+    return f"{sanitize_filename(source.stem)}_{timestamp()}.md"
 
 
 def unique_path(path: Path) -> Path:
@@ -182,7 +184,7 @@ class MarkItDownApp(tk.Tk):
         self.merge_sort_field_var = tk.StringVar(value=SORT_FIELD_LABELS["name"])
         self.merge_sort_direction_var = tk.StringVar(value="正序")
         self.output_dir_var = tk.StringVar(value="")
-        self.output_name_var = tk.StringVar(value=default_output_name())
+        self.output_name_var = tk.StringVar(value="")
         self.open_after_var = tk.StringVar(value="none")
         self.status_var = tk.StringVar(value="请选择文件并确认选项后开始转换。")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -275,9 +277,9 @@ class MarkItDownApp(tk.Tk):
         ttk.Button(toolbar, text="置底", command=self.move_selected_to_bottom).pack(
             side="left", padx=(8, 0)
         )
-        ttk.Button(toolbar, text="按当前规则排序", command=self.sort_files_by_name).pack(
-            side="left", padx=(8, 0)
-        )
+        ttk.Button(
+            toolbar, text="按当前规则排序", command=self.sort_files_by_name
+        ).pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="清空", command=self.clear_files).pack(
             side="left", padx=(8, 0)
         )
@@ -491,7 +493,9 @@ class MarkItDownApp(tk.Tk):
     def _build_output_name(self, parent: ttk.Frame) -> None:
         ttk.Entry(parent, textvariable=self.output_name_var).pack(fill="x")
         ttk.Label(
-            parent, text="默认是带时间戳的不重复 .md 文件名。", style="Muted.TLabel"
+            parent,
+            text="留空时会自动使用源文件名 + 时间戳的 .md 文件名。",
+            style="Muted.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
     def _build_open_after(self, parent: ttk.Frame) -> None:
@@ -647,7 +651,9 @@ class MarkItDownApp(tk.Tk):
 
     def _sorted_files(self) -> list[Path]:
         reverse = self.merge_sort_direction_var.get() == "倒序"
-        return sorted(self.selected_files, key=self._sort_key_components, reverse=reverse)
+        return sorted(
+            self.selected_files, key=self._sort_key_components, reverse=reverse
+        )
 
     def _apply_builtin_sort(self) -> None:
         self.selected_files = self._sorted_files()
@@ -727,7 +733,9 @@ class MarkItDownApp(tk.Tk):
             self._append_log("已切换为自定义顺序以进行手动调整。")
         selected_paths = [self.selected_files[index] for index in indices]
         remaining_paths = [
-            path for index, path in enumerate(self.selected_files) if index not in set(indices)
+            path
+            for index, path in enumerate(self.selected_files)
+            if index not in set(indices)
         ]
         self.selected_files = selected_paths + remaining_paths
         self._refresh_file_list()
@@ -744,7 +752,9 @@ class MarkItDownApp(tk.Tk):
             self._append_log("已切换为自定义顺序以进行手动调整。")
         selected_paths = [self.selected_files[index] for index in indices]
         remaining_paths = [
-            path for index, path in enumerate(self.selected_files) if index not in set(indices)
+            path
+            for index, path in enumerate(self.selected_files)
+            if index not in set(indices)
         ]
         self.selected_files = remaining_paths + selected_paths
         start_index = len(remaining_paths)
@@ -767,7 +777,12 @@ class MarkItDownApp(tk.Tk):
     def _refresh_preview(self) -> None:
         files = self.selected_files
         target_dir = self.output_dir_var.get().strip() or "源文件所在目录"
-        output_name = self.output_name_var.get().strip() or default_output_name()
+        preview_source = self._merge_ordered_files()[0] if files else None
+        output_name = self.output_name_var.get().strip() or (
+            default_output_name(preview_source)
+            if preview_source
+            else "源文件名_时间戳.md"
+        )
         mode_text = (
             "合并成单个 Markdown"
             if self.merge_var.get()
@@ -867,7 +882,12 @@ class MarkItDownApp(tk.Tk):
             else "分别生成多个 Markdown 文件"
         )
         target_dir = self.output_dir_var.get().strip() or "源文件所在目录"
-        output_name = self.output_name_var.get().strip() or default_output_name()
+        preview_source = self._merge_ordered_files()[0] if self.selected_files else None
+        output_name = self.output_name_var.get().strip() or (
+            default_output_name(preview_source)
+            if preview_source is not None
+            else "源文件名_时间戳.md"
+        )
         order_text = (
             self._order_description()
             if self.merge_order_var.get() == "builtin"
@@ -950,7 +970,7 @@ class MarkItDownApp(tk.Tk):
 
     def _resolve_output_name(self, source: Path, merged: bool) -> str:
         base = sanitize_filename(
-            self.output_name_var.get().strip() or default_output_name()
+            self.output_name_var.get().strip() or default_output_name(source)
         )
         if not base.lower().endswith(".md"):
             base = f"{base}.md"
