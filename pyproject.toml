@@ -1,0 +1,9 @@
+[project]
+dependencies = [
+    "markitdown[all]>=0.1.5",
+]
+description = "Add your description here"
+name = "markitdown-tk-gui"
+readme = "README.md"
+requires-python = ">=3.12"
+version = "0.1.0"
