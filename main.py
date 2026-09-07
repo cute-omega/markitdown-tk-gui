@@ -1,17 +1,38 @@
 from __future__ import annotations
 
 import concurrent.futures as cf
+import multiprocessing
 import os
 import queue
 import re
+import sys
 import threading
+import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from markitdown import MarkItDown
+
+if sys.stdout is None or sys.stderr is None:
+    sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+_shared_converter: MarkItDown | None = None
+
+
+def _get_shared_converter() -> MarkItDown:
+    global _shared_converter
+    if _shared_converter is None:
+        _shared_converter = MarkItDown()
+    return _shared_converter
+
+
+def _convert_source_in_process(source: Path) -> tuple[Path, str]:
+    converter = _get_shared_converter()
+    result = converter.convert(source)
+    markdown = result.markdown or result.text_content or ""
+    return source, markdown
 
 
 def timestamp() -> str:
@@ -23,9 +44,11 @@ def sanitize_filename(value: str) -> str:
     return cleaned or f"markitdown_{timestamp()}"
 
 
-def default_output_name(source: Path | None = None) -> str:
+def default_output_name(source: Path | None = None, *, no_timestamp: bool = False) -> str:
     if source is None:
         return f"markitdown_{timestamp()}.md"
+    if no_timestamp:
+        return f"{sanitize_filename(source.stem)}.md"
     return f"{sanitize_filename(source.stem)}_{timestamp()}.md"
 
 
@@ -57,6 +80,43 @@ class ConversionItem:
     output: Path | None
     success: bool
     error: str | None = None
+
+
+@dataclass(slots=True)
+class JobOptions:
+    ordered_sources: list[Path]
+    merge: bool
+    output_dir: str
+    output_name: str
+    no_timestamp: bool
+
+
+def build_output_dir(source: Path, merged: bool, configured: str) -> Path:
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return source.parent
+
+
+def resolve_output_name(
+    source: Path,
+    merged: bool,
+    configured: str,
+    total: int,
+    *,
+    no_timestamp: bool = False,
+) -> str:
+    custom = configured.strip()
+    if merged or total == 1:
+        base = sanitize_filename(
+            custom or default_output_name(source, no_timestamp=no_timestamp)
+        )
+    elif custom:
+        base = f"{sanitize_filename(custom)}_{sanitize_filename(source.stem)}"
+    else:
+        base = default_output_name(source, no_timestamp=no_timestamp)
+    if not base.lower().endswith(".md"):
+        base = f"{base}.md"
+    return base
 
 
 @dataclass(slots=True)
@@ -185,6 +245,7 @@ class MarkItDownApp(tk.Tk):
         self.merge_sort_direction_var = tk.StringVar(value="正序")
         self.output_dir_var = tk.StringVar(value="")
         self.output_name_var = tk.StringVar(value="")
+        self.no_timestamp_var = tk.BooleanVar(value=False)
         self.open_after_var = tk.StringVar(value="none")
         self.status_var = tk.StringVar(value="请选择文件并确认选项后开始转换。")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -492,6 +553,11 @@ class MarkItDownApp(tk.Tk):
 
     def _build_output_name(self, parent: ttk.Frame) -> None:
         ttk.Entry(parent, textvariable=self.output_name_var).pack(fill="x")
+        ttk.Checkbutton(
+            parent,
+            text="默认文件名不加时间戳（仅影响留空时的自动命名）",
+            variable=self.no_timestamp_var,
+        ).pack(anchor="w", pady=(4, 0))
         ttk.Label(
             parent,
             text="留空时会自动使用源文件名 + 时间戳的 .md 文件名。",
@@ -518,6 +584,7 @@ class MarkItDownApp(tk.Tk):
             self.merge_sort_direction_var,
             self.output_dir_var,
             self.output_name_var,
+            self.no_timestamp_var,
             self.open_after_var,
         ):
             variable.trace_add("write", lambda *_: self._refresh_preview())
@@ -779,9 +846,9 @@ class MarkItDownApp(tk.Tk):
         target_dir = self.output_dir_var.get().strip() or "源文件所在目录"
         preview_source = self._merge_ordered_files()[0] if files else None
         output_name = self.output_name_var.get().strip() or (
-            default_output_name(preview_source)
+            default_output_name(preview_source, no_timestamp=self.no_timestamp_var.get())
             if preview_source
-            else "源文件名_时间戳.md"
+            else ("源文件名.md" if self.no_timestamp_var.get() else "源文件名_时间戳.md")
         )
         mode_text = (
             "合并成单个 Markdown"
@@ -884,9 +951,9 @@ class MarkItDownApp(tk.Tk):
         target_dir = self.output_dir_var.get().strip() or "源文件所在目录"
         preview_source = self._merge_ordered_files()[0] if self.selected_files else None
         output_name = self.output_name_var.get().strip() or (
-            default_output_name(preview_source)
+            default_output_name(preview_source, no_timestamp=self.no_timestamp_var.get())
             if preview_source is not None
-            else "源文件名_时间戳.md"
+            else ("源文件名.md" if self.no_timestamp_var.get() else "源文件名_时间戳.md")
         )
         order_text = (
             self._order_description()
@@ -896,7 +963,7 @@ class MarkItDownApp(tk.Tk):
         return (
             f"即将转换 {len(self.selected_files)} 个文件。\n\n"
             f"模式: {mode}\n"
-            f"合并顺序: {order_text}\n"
+            f"合并顺序: {order_text if self.merge_var.get() else 'none'}\n"
             f"目标目录: {target_dir}\n"
             f"输出文件名: {output_name}\n"
             f"转换后打开: {self.open_after_var.get()}\n\n"
@@ -924,7 +991,19 @@ class MarkItDownApp(tk.Tk):
         self.status_var.set("正在准备转换任务...")
         self._append_log("开始转换。")
 
-        thread = threading.Thread(target=self._worker, daemon=True)
+        options = JobOptions(
+            ordered_sources=(
+                self._merge_ordered_files()
+                if self.merge_var.get()
+                else list(self.selected_files)
+            ),
+            merge=self.merge_var.get(),
+            output_dir=self.output_dir_var.get().strip(),
+            output_name=self.output_name_var.get().strip(),
+            no_timestamp=self.no_timestamp_var.get(),
+        )
+
+        thread = threading.Thread(target=self._worker, args=(options,), daemon=True)
         thread.start()
 
     def _set_input_state(self, state: str) -> None:
@@ -950,62 +1029,47 @@ class MarkItDownApp(tk.Tk):
         for child in widget.winfo_children():
             self._toggle_widget_state(child, state, exclude)
 
-    def _worker(self) -> None:
+    def _worker(self, options: JobOptions) -> None:
         try:
-            if self.merge_var.get():
-                items = self._convert_merged()
+            if options.merge:
+                items = self._convert_merged(options)
             else:
-                items = self._convert_separate()
+                items = self._convert_separate(options)
             self.worker_queue.put(("done", items))
         except Exception as exc:  # noqa: BLE001
             self.worker_queue.put(("fatal", exc))
 
-    def _build_output_dir(self, source: Path, merged: bool) -> Path:
-        configured = self.output_dir_var.get().strip()
-        if configured:
-            return Path(configured).expanduser().resolve()
-        if merged:
-            return self._merge_ordered_files()[0].parent
-        return source.parent
-
-    def _resolve_output_name(self, source: Path, merged: bool) -> str:
-        base = sanitize_filename(
-            self.output_name_var.get().strip() or default_output_name(source)
-        )
-        if not base.lower().endswith(".md"):
-            base = f"{base}.md"
-        if merged or len(self.selected_files) == 1:
-            return base
-        return f"{Path(base).stem}_{sanitize_filename(source.stem)}.md"
-
-    def _convert_source(self, source: Path) -> tuple[Path, str]:
-        converter = MarkItDown()
-        result = converter.convert(source)
-        markdown = result.markdown or result.text_content or ""
-        return source, markdown
-
-    def _convert_separate(self) -> list[ConversionItem]:
-        ordered_sources = list(self.selected_files)
+    def _convert_separate(self, options: JobOptions) -> list[ConversionItem]:
+        ordered_sources = options.ordered_sources
         total = len(ordered_sources)
         items: list[ConversionItem] = []
         if total == 0:
             return items
 
-        max_workers = min(8, max(2, total))
-        with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            plans = []
+        max_workers = min(8, os.cpu_count() or 4, max(2, total))
+        with cf.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_info: dict[cf.Future, tuple[Path, Path]] = {}
             for source in ordered_sources:
-                output_dir = self._build_output_dir(source, merged=False)
+                output_dir = build_output_dir(source, False, options.output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 output_path = unique_path(
-                    output_dir / self._resolve_output_name(source, merged=False)
+                    output_dir
+                    / resolve_output_name(
+                        source,
+                        False,
+                        options.output_name,
+                        total,
+                        no_timestamp=options.no_timestamp,
+                    )
                 )
-                plans.append(
-                    (source, output_path, executor.submit(self._convert_source, source))
-                )
+                future = executor.submit(_convert_source_in_process, source)
+                future_info[future] = (source, output_path)
 
-            for index, (source, output_path, future) in enumerate(plans, start=1):
-                self.worker_queue.put(("status", f"正在转换 {source.name}"))
+            completed = 0
+            for future in cf.as_completed(future_info):
+                source, output_path = future_info[future]
+                completed += 1
+                self.worker_queue.put(("status", f"正在转换第 {completed}/{total} 个文件"))
                 try:
                     _, markdown = future.result()
                     output_path.write_text(markdown.rstrip() + "\n", encoding="utf-8")
@@ -1021,35 +1085,42 @@ class MarkItDownApp(tk.Tk):
                     )
                     self.worker_queue.put(("log", f"转换失败: {source} -> {exc}"))
 
-                self.worker_queue.put(("progress", index / total * 100))
-                self.worker_queue.put(("progress_text", f"{index} / {total}"))
+                self.worker_queue.put(("progress", completed / total * 100))
+                self.worker_queue.put(("progress_text", f"{completed} / {total}"))
 
         return items
 
-    def _convert_merged(self) -> list[ConversionItem]:
-        ordered_sources = self._merge_ordered_files()
+    def _convert_merged(self, options: JobOptions) -> list[ConversionItem]:
+        ordered_sources = options.ordered_sources
         total = len(ordered_sources)
         items: list[ConversionItem] = []
         if total == 0:
             return items
 
-        output_dir = self._build_output_dir(ordered_sources[0], merged=True)
+        output_dir = build_output_dir(ordered_sources[0], True, options.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = unique_path(
-            output_dir / self._resolve_output_name(ordered_sources[0], merged=True)
+            output_dir
+            / resolve_output_name(
+                ordered_sources[0],
+                True,
+                options.output_name,
+                total,
+                no_timestamp=options.no_timestamp,
+            )
         )
         results: dict[Path, tuple[bool, str | None]] = {}
 
-        max_workers = min(8, max(2, total))
-        with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        max_workers = min(8, os.cpu_count() or 4, max(2, total))
+        with cf.ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_source = {
-                executor.submit(self._convert_source, source): source
+                executor.submit(_convert_source_in_process, source): source
                 for source in ordered_sources
             }
             completed = 0
             for future in cf.as_completed(future_to_source):
                 source = future_to_source[future]
-                completed += 1
+                completed += 1  # ruff: ignore[enumerate-for-loop]
                 self.worker_queue.put(("status", f"正在转换 {source.name}"))
                 try:
                     _, markdown = future.result()
@@ -1165,6 +1236,7 @@ class MarkItDownApp(tk.Tk):
 
 
 def main() -> None:
+    multiprocessing.freeze_support()
     app = MarkItDownApp()
     app.mainloop()
 

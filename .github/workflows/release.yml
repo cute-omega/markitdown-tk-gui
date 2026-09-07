@@ -1,0 +1,128 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "发布到的标签（如 v1.0.0，会自动创建）。留空则只构建产物不上传。"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.12"
+  APP_NAME: markitdown-tk-gui
+
+jobs:
+  build:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x86_64
+            asset_name: markitdown-tk-gui-windows-x86_64.zip
+          - os: ubuntu-24.04
+            target: linux-x86_64
+            asset_name: markitdown-tk-gui-linux-x86_64.tar.gz
+          - os: macos-13
+            target: macos-x86_64
+            asset_name: markitdown-tk-gui-macos-x86_64.tar.gz
+          - os: macos-14
+            target: macos-arm64
+            asset_name: markitdown-tk-gui-macos-arm64.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install project dependencies
+        run: uv sync
+
+      - name: Verify tkinter is available
+        run: uv run python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
+
+      - name: Build portable executable with PyInstaller
+        run: |
+          uv run --with pyinstaller pyinstaller \
+            --noconfirm --clean --onefile --windowed \
+            --name ${{ env.APP_NAME }} \
+            --collect-all magika \
+            --collect-all markitdown \
+            --collect-all onnxruntime \
+            main.py
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/${{ env.APP_NAME }}.exe" -DestinationPath "${{ matrix.asset_name }}"
+          Get-Item "${{ matrix.asset_name }}" | Select-Object Name, Length
+
+      - name: Package Linux/macOS artifact
+        if: runner.os != 'Windows'
+        run: |
+          if [ -d "dist/${{ env.APP_NAME }}.app" ]; then
+            SRC="dist/${{ env.APP_NAME }}.app"
+          else
+            SRC="dist/${{ env.APP_NAME }}"
+          fi
+          tar -czf "${{ matrix.asset_name }}" "$SRC"
+          ls -lh "${{ matrix.asset_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+
+    steps:
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum ./* > SHA256SUMS
+
+      - name: Create or update release
+        working-directory: artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            ./* \
+            --title "markitdown-tk-gui ${{ steps.tag.outputs.tag }}" \
+            --generate-notes

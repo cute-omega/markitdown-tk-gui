@@ -1,0 +1,9 @@
+*.cmd
+*.pyc
+*.spec
+.venv/
+__pycache__/
+build/
+dist/
+batch_test_*/
+frozen_probe*
