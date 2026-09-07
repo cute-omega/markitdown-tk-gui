@@ -56,7 +56,7 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。PDF 解析（pdf
 
 ### 并发资源权衡
 
-进程池数量取 `min(8, CPU 核数, 文件数)`。子进程会各自加载一份模型与解析库，内存占用随并发数线性增长——文件很少或机型内存紧张时可下调该上限。
+并发进程数在「输出选项 → 并发进程数」里可调，默认 `4`（取值范围 1–8）。每个子进程都会加载一份模型与解析库，再加上单个大文件的解析峰值，**总内存峰值 ≈ 并发数 × 单文件峰值**。转换单文件达数百 MB、甚至上 GB 的 PDF 时，并发数开满 8 很容易把内存吃爆导致系统重启，遇到大文件请调小到 `1–2`。
 
 ## 打包发布（GitHub Actions）
 
@@ -66,19 +66,19 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。PDF 解析（pdf
 |------|------|
 | Windows x64 | `markitdown-tk-gui-windows-x86_64.zip`（内含单个 `.exe`） |
 | Linux x64 | `markitdown-tk-gui-linux-x86_64.tar.gz` |
-| macOS Intel | `markitdown-tk-gui-macos-x86_64.tar.gz`（内含 `.app`） |
-| macOS Apple Silicon | `markitdown-tk-gui-macos-arm64.tar.gz`（内含 `.app`） |
+| macOS（Apple Silicon） | `markitdown-tk-gui-macos-arm64.tar.gz`（内含 `.app`） |
 
 ### 触发方式
 
-- **推标签自动发布**：`git tag v1.0.0 && git push origin v1.0.0` → 自动构建四个平台产物并以该标签发布 Release（含自动 changelog 与 SHA256 校验和）。
+- **推标签自动发布**：`git tag v1.0.0 && git push origin v1.0.0` → 自动构建三个平台产物并以该标签发布 Release（含自动 changelog 与 SHA256 校验和）。
 - **手动构建**：Actions 页面 → 「Build and Release」→ «Run workflow»，填 `release_tag` 即构建并发布；留空则只构建不发布。
 
 ### 打包要点
 
 - 每个 runner 用 `uv sync` 安装 `markitdown[all]` 后，以 `--collect-all magika/onnxruntime` 收集 ONNX 模型等数据文件，产出单文件可执行程序。
 - 打包后 `ProcessPoolExecutor` 的子进程会重新执行打包后的可执行文件，因此 `main()` 里已调用 `multiprocessing.freeze_support()`，保证并发转换在冻结环境下照常工作（含各子进程内模型独立加载）。
-- macOS 构建分别用 `macos-13`/`macos-14` 覆盖 Intel 与 Apple Silicon；若 GitHub 淘汰对应镜像，把 `release.yml` 里的 `runs-on` 换成仍可用的 macos 标签即可。
+- Linux runner 需先 `apt install python3-tk`（GitHub 提供的 Python 构建默认不含 tkinter），并让 uv 优先用系统 Python（`UV_PYTHON_PREFERENCE=system`）。
+- macOS 只提供 Apple Silicon 产物：GitHub 已停用 Intel (macos-13) 免费 runner。Intel Mac 如需 exe 请在本地执行同样的 PyInstaller 命令自行构建。
 
 ## 项目结构
 

@@ -32,12 +32,12 @@ jobs:
           - os: ubuntu-24.04
             target: linux-x86_64
             asset_name: markitdown-tk-gui-linux-x86_64.tar.gz
-          - os: macos-13
-            target: macos-x86_64
-            asset_name: markitdown-tk-gui-macos-x86_64.tar.gz
           - os: macos-14
             target: macos-arm64
             asset_name: markitdown-tk-gui-macos-arm64.tar.gz
+
+    env:
+      UV_PYTHON_PREFERENCE: system
 
     steps:
       - name: Checkout
@@ -48,6 +48,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: Install tkinter for Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
       - name: Install project dependencies
         run: uv sync
 
@@ -55,6 +59,7 @@ jobs:
         run: uv run python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
 
       - name: Build portable executable with PyInstaller
+        shell: bash
         run: |
           uv run --with pyinstaller pyinstaller \
             --noconfirm --clean --onefile --windowed \

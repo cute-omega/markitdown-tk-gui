@@ -44,6 +44,10 @@ def sanitize_filename(value: str) -> str:
     return cleaned or f"markitdown_{timestamp()}"
 
 
+DEFAULT_WORKERS = max(1, min(4, os.cpu_count() or 2))
+WORKER_CHOICES = ("1", "2", "4", "6", "8")
+
+
 def default_output_name(source: Path | None = None, *, no_timestamp: bool = False) -> str:
     if source is None:
         return f"markitdown_{timestamp()}.md"
@@ -89,6 +93,7 @@ class JobOptions:
     output_dir: str
     output_name: str
     no_timestamp: bool
+    concurrency: int = DEFAULT_WORKERS
 
 
 def build_output_dir(source: Path, merged: bool, configured: str) -> Path:
@@ -246,6 +251,7 @@ class MarkItDownApp(tk.Tk):
         self.output_dir_var = tk.StringVar(value="")
         self.output_name_var = tk.StringVar(value="")
         self.no_timestamp_var = tk.BooleanVar(value=False)
+        self.concurrency_var = tk.StringVar(value=str(DEFAULT_WORKERS))
         self.open_after_var = tk.StringVar(value="none")
         self.status_var = tk.StringVar(value="请选择文件并确认选项后开始转换。")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -373,6 +379,7 @@ class MarkItDownApp(tk.Tk):
         self._add_option_row(options_box, 2, "目标目录", self._build_target_dir)
         self._add_option_row(options_box, 3, "输出文件名", self._build_output_name)
         self._add_option_row(options_box, 4, "转换后打开", self._build_open_after)
+        self._add_option_row(options_box, 5, "并发进程数", self._build_workers)
 
         action_box = ttk.Frame(right, style="Surface.TFrame")
         action_box.pack(fill="x", pady=(12, 0))
@@ -575,6 +582,20 @@ class MarkItDownApp(tk.Tk):
             ttk.Radiobutton(
                 choices, text=text, value=value, variable=self.open_after_var
             ).pack(side="left", padx=(0, 12))
+
+    def _build_workers(self, parent: ttk.Frame) -> None:
+        ttk.Combobox(
+            parent,
+            textvariable=self.concurrency_var,
+            values=WORKER_CHOICES,
+            state="readonly",
+            width=6,
+        ).pack(anchor="w")
+        ttk.Label(
+            parent,
+            text="每批同时转换的文件数。内存占用 ≈ 并发数 × 单文件峰值；文件很大或内存紧张时请调小。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
 
     def _bind_live_updates(self) -> None:
         for variable in (
@@ -1001,6 +1022,7 @@ class MarkItDownApp(tk.Tk):
             output_dir=self.output_dir_var.get().strip(),
             output_name=self.output_name_var.get().strip(),
             no_timestamp=self.no_timestamp_var.get(),
+            concurrency=self._selected_workers(),
         )
 
         thread = threading.Thread(target=self._worker, args=(options,), daemon=True)
@@ -1029,6 +1051,12 @@ class MarkItDownApp(tk.Tk):
         for child in widget.winfo_children():
             self._toggle_widget_state(child, state, exclude)
 
+    def _selected_workers(self) -> int:
+        try:
+            return max(1, int(self.concurrency_var.get()))
+        except (ValueError, tk.TclError):
+            return DEFAULT_WORKERS
+
     def _worker(self, options: JobOptions) -> None:
         try:
             if options.merge:
@@ -1046,7 +1074,7 @@ class MarkItDownApp(tk.Tk):
         if total == 0:
             return items
 
-        max_workers = min(8, os.cpu_count() or 4, max(2, total))
+        max_workers = max(1, min(options.concurrency, total))
         with cf.ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_info: dict[cf.Future, tuple[Path, Path]] = {}
             for source in ordered_sources:
@@ -1111,7 +1139,7 @@ class MarkItDownApp(tk.Tk):
         )
         results: dict[Path, tuple[bool, str | None]] = {}
 
-        max_workers = min(8, os.cpu_count() or 4, max(2, total))
+        max_workers = max(1, min(options.concurrency, total))
         with cf.ProcessPoolExecutor(max_workers=max_workers) as executor:
             future_to_source = {
                 executor.submit(_convert_source_in_process, source): source
