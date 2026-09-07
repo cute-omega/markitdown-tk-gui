@@ -1,6 +1,7 @@
 [project]
 dependencies = [
   "markitdown[all]>=0.1.5",
+  "psutil>=6.0.0",
 ]
 description = "A tkinter GUI for markitdown, a Markdown to HTML converter."
 name = "markitdown-tk-gui"

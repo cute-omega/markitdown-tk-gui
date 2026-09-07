@@ -1,18 +1,21 @@
 from __future__ import annotations
 
-import concurrent.futures as cf
-import multiprocessing
+import collections
+import itertools
+import multiprocessing as mp
 import os
 import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import psutil
 from markitdown import MarkItDown
 
 if sys.stdout is None or sys.stderr is None:
@@ -28,11 +31,71 @@ def _get_shared_converter() -> MarkItDown:
     return _shared_converter
 
 
-def _convert_source_in_process(source: Path) -> tuple[Path, str]:
+RECYCLE_MIN_MB = 384
+TASK_TIMEOUT = 600.0
+AMPLIFY_FACTOR = 5.0
+
+
+def _process_rss() -> int:
+    try:
+        return psutil.Process().memory_info().rss
+    except psutil.Error:
+        return 0
+
+
+def _pool_child(task_q: mp.Queue, result_q: mp.Queue) -> None:
     converter = _get_shared_converter()
-    result = converter.convert(source)
-    markdown = result.markdown or result.text_content or ""
-    return source, markdown
+    while True:
+        task = task_q.get()
+        if task is None:
+            break
+        index, source = task
+        try:
+            result = converter.convert(source)
+            markdown = result.markdown or result.text_content or ""
+            result_q.put((os.getpid(), index, source, True, markdown, None, _process_rss()))
+        except Exception as exc:  # noqa: BLE001
+            result_q.put((os.getpid(), index, source, False, "", repr(exc), _process_rss()))
+
+
+class _MemoryGovernor(threading.Thread):
+    """GUI 进程内监控「本进程 + 所有子进程」的总内存，超过阈值标记拥塞。"""
+
+    def __init__(self, limit_mb: int, interval: float = 0.5) -> None:
+        super().__init__(daemon=True)
+        try:
+            phys_mb = psutil.virtual_memory().total // (1024 * 1024)
+        except psutil.Error:
+            phys_mb = 0
+        self.hard_mb = max(256, int(limit_mb) or int(phys_mb * 0.85))
+        self.soft_mb = max(128, int(self.hard_mb * 0.6))
+        self.congested = False
+        self.rss_bytes = 0
+        self._interval = interval
+        self._stop = threading.Event()
+
+    def run(self) -> None:
+        try:
+            proc = psutil.Process()
+        except psutil.Error:
+            proc = None
+        while not self._stop.wait(self._interval):
+            total = self.rss_bytes
+            if proc is not None:
+                try:
+                    total = proc.memory_info().rss
+                    for child in proc.children(recursive=True):
+                        total += child.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            self.rss_bytes = total
+            if total > self.hard_mb * 1024 * 1024:
+                self.congested = True
+            elif total < self.soft_mb * 1024 * 1024:
+                self.congested = False
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 def timestamp() -> str:
@@ -94,6 +157,7 @@ class JobOptions:
     output_name: str
     no_timestamp: bool
     concurrency: int = DEFAULT_WORKERS
+    memory_limit_mb: int = 0
 
 
 def build_output_dir(source: Path, merged: bool, configured: str) -> Path:
@@ -252,6 +316,7 @@ class MarkItDownApp(tk.Tk):
         self.output_name_var = tk.StringVar(value="")
         self.no_timestamp_var = tk.BooleanVar(value=False)
         self.concurrency_var = tk.StringVar(value=str(DEFAULT_WORKERS))
+        self.memory_limit_var = tk.StringVar(value="0")
         self.open_after_var = tk.StringVar(value="none")
         self.status_var = tk.StringVar(value="请选择文件并确认选项后开始转换。")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -380,6 +445,7 @@ class MarkItDownApp(tk.Tk):
         self._add_option_row(options_box, 3, "输出文件名", self._build_output_name)
         self._add_option_row(options_box, 4, "转换后打开", self._build_open_after)
         self._add_option_row(options_box, 5, "并发进程数", self._build_workers)
+        self._add_option_row(options_box, 6, "内存上限", self._build_memory_limit)
 
         action_box = ttk.Frame(right, style="Surface.TFrame")
         action_box.pack(fill="x", pady=(12, 0))
@@ -594,6 +660,14 @@ class MarkItDownApp(tk.Tk):
         ttk.Label(
             parent,
             text="每批同时转换的文件数。内存占用 ≈ 并发数 × 单文件峰值；文件很大或内存紧张时请调小。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+
+    def _build_memory_limit(self, parent: ttk.Frame) -> None:
+        ttk.Entry(parent, textvariable=self.memory_limit_var, width=10).pack(anchor="w")
+        ttk.Label(
+            parent,
+            text="本程序+所有子进程的内存上限（MB）；0=自动（物理内存 85%）。程序会自监控并自动降并发/回收进程。",
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
@@ -1023,6 +1097,7 @@ class MarkItDownApp(tk.Tk):
             output_name=self.output_name_var.get().strip(),
             no_timestamp=self.no_timestamp_var.get(),
             concurrency=self._selected_workers(),
+            memory_limit_mb=self._selected_memory_limit(),
         )
 
         thread = threading.Thread(target=self._worker, args=(options,), daemon=True)
@@ -1057,143 +1132,280 @@ class MarkItDownApp(tk.Tk):
         except (ValueError, tk.TclError):
             return DEFAULT_WORKERS
 
+    def _selected_memory_limit(self) -> int:
+        try:
+            return max(0, int(self.memory_limit_var.get()))
+        except (ValueError, tk.TclError):
+            return 0
+
     def _worker(self, options: JobOptions) -> None:
         try:
-            if options.merge:
-                items = self._convert_merged(options)
-            else:
-                items = self._convert_separate(options)
+            items = self._convert_pooled(options)
             self.worker_queue.put(("done", items))
         except Exception as exc:  # noqa: BLE001
             self.worker_queue.put(("fatal", exc))
 
-    def _convert_separate(self, options: JobOptions) -> list[ConversionItem]:
-        ordered_sources = options.ordered_sources
-        total = len(ordered_sources)
+    def _convert_pooled(self, options: JobOptions) -> list[ConversionItem]:
+        """常驻受管进程池：模型每子进程只加载一次复用；
+        派发前按文件大小预估内存峰值，优先复用空闲子进程、几乎不中途新建；
+        内存监控（GUI 进程）超阈值时在线降并发并定点回收涨大的子进程。"""
+        ordered = options.ordered_sources
+        total = len(ordered)
         items: list[ConversionItem] = []
         if total == 0:
             return items
 
-        max_workers = max(1, min(options.concurrency, total))
-        with cf.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_info: dict[cf.Future, tuple[Path, Path]] = {}
-            for source in ordered_sources:
-                output_dir = build_output_dir(source, False, options.output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
-                output_path = unique_path(
-                    output_dir
-                    / resolve_output_name(
-                        source,
-                        False,
-                        options.output_name,
-                        total,
-                        no_timestamp=options.no_timestamp,
-                    )
+        merged = options.merge
+        merged_path: Path | None = None
+        if merged:
+            output_dir = build_output_dir(ordered[0], True, options.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            merged_path = unique_path(
+                output_dir
+                / resolve_output_name(
+                    ordered[0],
+                    True,
+                    options.output_name,
+                    total,
+                    no_timestamp=options.no_timestamp,
                 )
-                future = executor.submit(_convert_source_in_process, source)
-                future_info[future] = (source, output_path)
+            )
 
-            completed = 0
-            for future in cf.as_completed(future_info):
-                source, output_path = future_info[future]
-                completed += 1
-                self.worker_queue.put(("status", f"正在转换第 {completed}/{total} 个文件"))
+        target = max(1, min(options.concurrency, total))
+        governor = _MemoryGovernor(options.memory_limit_mb)
+        governor.start()
+        hard_mb = governor.hard_mb
+        recycle_bytes = max(RECYCLE_MIN_MB, hard_mb // max(1, target)) * 1024 * 1024
+        limit = target
+        pending: collections.deque[tuple[int, Path]] = collections.deque(
+            (i, s) for i, s in enumerate(ordered)
+        )
+        results: dict[int, tuple[Path, bool, str]] = {}
+
+        result_q = mp.Queue()
+        processes: dict[int, mp.Process] = {}
+        task_qs: dict[int, mp.Queue] = {}
+        pid_to_key: dict[int, int] = {}
+        busy: dict[int, tuple[int, Path, Path | None, float]] = {}
+        rss_by_key: dict[int, int] = {}
+        attempts: dict[int, int] = {}
+        key_counter = itertools.count()
+        all_procs: list[mp.Process] = []
+
+        def spawn() -> int | None:
+            q = mp.Queue()
+            try:
+                p = mp.Process(target=_pool_child, args=(q, result_q), daemon=True)
+                p.start()
+            except OSError:
+                return None
+            key = next(key_counter)
+            processes[key] = p
+            all_procs.append(p)
+            task_qs[key] = q
+            pid_to_key[p.pid] = key
+            rss_by_key[key] = 0
+            return key
+
+        def retire(key: int, respawn: bool) -> None:
+            p = processes.pop(key, None)
+            task_qs.pop(key, None)
+            busy.pop(key, None)
+            rss_by_key.pop(key, None)
+            if p is not None:
+                pid_to_key.pop(p.pid, None)
                 try:
-                    _, markdown = future.result()
-                    output_path.write_text(markdown.rstrip() + "\n", encoding="utf-8")
-                    items.append(
-                        ConversionItem(source=source, output=output_path, success=True)
-                    )
-                    self.worker_queue.put(("log", f"已生成: {output_path}"))
-                except Exception as exc:  # noqa: BLE001
-                    items.append(
-                        ConversionItem(
-                            source=source, output=None, success=False, error=str(exc)
-                        )
-                    )
-                    self.worker_queue.put(("log", f"转换失败: {source} -> {exc}"))
+                    p.terminate()
+                except (ValueError, OSError):
+                    pass
+            if respawn:
+                spawn()
 
+        def output_for(index: int, source: Path) -> Path:
+            if merged:
+                assert merged_path is not None
+                return merged_path
+            output_dir = build_output_dir(source, False, options.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            return unique_path(
+                output_dir
+                / resolve_output_name(
+                    source,
+                    False,
+                    options.output_name,
+                    total,
+                    no_timestamp=options.no_timestamp,
+                )
+            )
+
+        def estimate_mb(source: Path) -> int:
+            try:
+                size_mb = source.stat().st_size / (1024 * 1024)
+            except OSError:
+                return 0
+            return max(64, round(size_mb * AMPLIFY_FACTOR))
+
+        def best_idle_child(est_mb: int) -> int | None:
+            # 复用优先：找空闲且剩余容量能装下该任务预估峰值的子进程
+            idle = [k for k in processes if k not in busy]
+            if not idle:
+                return None
+            share_mb = max(1, hard_mb // max(1, len(processes)))
+            for key in idle:
+                used_mb = rss_by_key.get(key, 0) // (1024 * 1024)
+                if used_mb + est_mb <= share_mb:
+                    return key
+            # 都不够装（大文件），退而选负载最低的；瞬时峰值由 governor 兜底
+            return min(idle, key=lambda k: rss_by_key.get(k, 0))
+
+        def feed() -> None:
+            if not pending:
+                return
+            # 容量感知派发：优先复用空闲子进程（模型零重载）；
+            # 只在"池未满 + 不拥塞"时才新建进程；拥塞时最多保 1 个在飞，保证必然推进。
+            want = min(limit, target, len(pending))
+            if governor.congested:
+                want = min(want, 1)
+            while len(processes) < want:
+                if spawn() is None:
+                    return
+            key = best_idle_child(estimate_mb(pending[0][1]))
+            if key is None:
+                return
+            index, source = pending.popleft()
+            try:
+                task_qs[key].put((index, source))
+            except (ValueError, OSError):
+                retire(key, respawn=False)
+                pending.appendleft((index, source))
+                return
+            busy[key] = (index, source, output_for(index, source), time.monotonic())
+
+        try:
+            feed()
+            completed = 0
+            trim_pending = False
+            while completed < total:
+                try:
+                    payload = result_q.get(timeout=0.4)
+                except queue.Empty:
+                    now = time.monotonic()
+                    # 卡死/崩溃的子进程：按任务超时重派（最多重试 2 次）
+                    for key, (idx, src, _out, sent_at) in list(busy.items()):
+                        if now - sent_at <= TASK_TIMEOUT:
+                            continue
+                        attempts[idx] = attempts.get(idx, 0) + 1
+                        if attempts[idx] > 2:
+                            results[idx] = (src, False, f"任务超时（>{int(TASK_TIMEOUT)}s）")
+                            completed += 1
+                            self.worker_queue.put(
+                                ("log", f"转换失败: {src} -> 任务超时")
+                            )
+                            self.worker_queue.put(("progress", completed / total * 100))
+                            self.worker_queue.put(
+                                ("progress_text", f"{completed} / {total}")
+                            )
+                        else:
+                            self.worker_queue.put(
+                                ("log", f"子进程卡死，重派任务: {src.name}")
+                            )
+                            pending.appendleft((idx, src))
+                        retire(key, respawn=True)
+                    # 超限时在线降并发；回落后缓慢恢复
+                    if governor.congested and limit > 1 and not trim_pending:
+                        limit -= 1
+                        trim_pending = True
+                        idle = [k for k in processes if k not in busy]
+                        if idle:
+                            retire(idle[-1], respawn=False)
+                    elif not governor.congested and trim_pending:
+                        trim_pending = False
+                    if (
+                        not governor.congested
+                        and limit < target
+                        and completed >= 2
+                        and completed % 2 == 0
+                    ):
+                        limit = min(target, limit + 1)
+                    feed()
+                    continue
+
+                pid, index, source, ok, payload, err, rss = payload
+                key = pid_to_key.get(pid)
+                if key is None:
+                    continue
+                out = busy.get(key, (0, source, None, 0.0))[2]
+                busy.pop(key, None)
+                rss_by_key[key] = rss
+                completed += 1
+                mb = rss // (1024 * 1024)
+                self.worker_queue.put(
+                    ("status", f"第 {completed}/{total} 个完成 · 内存 {mb} MB / 上限 {hard_mb} MB")
+                )
                 self.worker_queue.put(("progress", completed / total * 100))
                 self.worker_queue.put(("progress_text", f"{completed} / {total}"))
-
-        return items
-
-    def _convert_merged(self, options: JobOptions) -> list[ConversionItem]:
-        ordered_sources = options.ordered_sources
-        total = len(ordered_sources)
-        items: list[ConversionItem] = []
-        if total == 0:
-            return items
-
-        output_dir = build_output_dir(ordered_sources[0], True, options.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = unique_path(
-            output_dir
-            / resolve_output_name(
-                ordered_sources[0],
-                True,
-                options.output_name,
-                total,
-                no_timestamp=options.no_timestamp,
-            )
-        )
-        results: dict[Path, tuple[bool, str | None]] = {}
-
-        max_workers = max(1, min(options.concurrency, total))
-        with cf.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_to_source = {
-                executor.submit(_convert_source_in_process, source): source
-                for source in ordered_sources
-            }
-            completed = 0
-            for future in cf.as_completed(future_to_source):
-                source = future_to_source[future]
-                completed += 1  # ruff: ignore[enumerate-for-loop]
-                self.worker_queue.put(("status", f"正在转换 {source.name}"))
-                try:
-                    _, markdown = future.result()
-                    results[source] = (True, markdown)
-                    items.append(
-                        ConversionItem(source=source, output=output_path, success=True)
-                    )
-                    self.worker_queue.put(("log", f"已转换: {source}"))
-                except Exception as exc:  # noqa: BLE001
-                    results[source] = (False, str(exc))
+                if ok:
+                    results[index] = (source, True, payload)
+                    if merged:
+                        self.worker_queue.put(("log", f"已转换: {source}"))
+                    else:
+                        assert out is not None
+                        out.write_text(payload.rstrip() + "\n", encoding="utf-8")
+                        items.append(
+                            ConversionItem(source=source, output=out, success=True)
+                        )
+                        self.worker_queue.put(("log", f"已生成: {out}"))
+                else:
+                    results[index] = (source, False, err or "未知错误")
                     items.append(
                         ConversionItem(
                             source=source,
-                            output=output_path,
+                            output=out if not merged else merged_path,
                             success=False,
-                            error=str(exc),
+                            error=err or "未知错误",
                         )
                     )
-                    self.worker_queue.put(("log", f"转换失败: {source} -> {exc}"))
+                    self.worker_queue.put(("log", f"转换失败: {source} -> {err}"))
 
-                self.worker_queue.put(("progress", completed / total * 100))
-                self.worker_queue.put(("progress_text", f"{completed} / {total}"))
+                if rss > recycle_bytes:
+                    self.worker_queue.put(
+                        ("log", f"回收子进程 {key}: RSS {mb} MB 超限，重建并换新进程")
+                    )
+                    retire(key, respawn=(pending or bool(busy)))
+                feed()
+        finally:
+            for key in list(processes):
+                retire(key, respawn=False)
+            for p in all_procs:
+                p.join(timeout=5)
+            governor.stop()
 
-        merged_parts: list[str] = []
-        for source in ordered_sources:
-            success, payload = results.get(source, (False, "未获取到转换结果"))
-            if success:
-                merged_parts.append(
-                    f"# {source.name}\n\n{(payload or '').strip()}".rstrip()
+        if merged:
+            assert merged_path is not None
+            merged_parts: list[str] = []
+            for index, source in enumerate(ordered):
+                _src, ok, payload2 = results.get(
+                    index, (source, False, "未获取到转换结果")
                 )
-            else:
-                merged_parts.append(f"# {source.name}\n\n> 转换失败: {payload}")
-
-        merged_markdown = "\n\n---\n\n".join(merged_parts).rstrip() + "\n"
-        output_path.write_text(merged_markdown, encoding="utf-8")
-        self.worker_queue.put(("log", f"已生成合并文件: {output_path}"))
-        return [
-            ConversionItem(
-                source=item.source,
-                output=output_path,
-                success=item.success,
-                error=item.error,
-            )
-            for item in items
-        ]
+                if ok:
+                    merged_parts.append(
+                        f"# {source.name}\n\n{(payload2 or '').strip()}".rstrip()
+                    )
+                else:
+                    merged_parts.append(f"# {source.name}\n\n> 转换失败: {payload2}")
+            merged_markdown = "\n\n---\n\n".join(merged_parts).rstrip() + "\n"
+            merged_path.write_text(merged_markdown, encoding="utf-8")
+            self.worker_queue.put(("log", f"已生成合并文件: {merged_path}"))
+            items = [
+                ConversionItem(
+                    source=src,
+                    output=merged_path,
+                    success=ok3,
+                    error=None if ok3 else err3,
+                )
+                for (src, ok3, err3) in results.values()
+            ]
+        return items
 
     def _poll_queue(self) -> None:
         try:
