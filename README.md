@@ -90,9 +90,9 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。CPU 密集的解
 
 | 平台 | 产物 |
 |------|------|
-| Windows x64 | `markitdown-tk-gui-windows-x86_64.exe`（单文件可执行） |
-| Linux x64 | `markitdown-tk-gui-linux-x86_64`（单文件可执行） |
-| macOS（Apple Silicon） | `markitdown-tk-gui-macos-arm64.app`（.app 目录包） |
+| Windows x64 | `markitdown-tk-gui-v{version}-windows-x86_64.exe`（单文件可执行） |
+| Linux x64 | `markitdown-tk-gui-v{version}-linux-x86_64`（单文件可执行） |
+| macOS（Apple Silicon） | `markitdown-tk-gui-v{version}-macos-arm64.zip`（.app 打包） |
 
 ### 触发方式
 
@@ -140,3 +140,19 @@ GPL-3.0 License (see [LICENSE](LICENSE) for details)。
    ```
 
    安装后重启 WSL2，再运行 GUI 即可。
+
+2. **WSL2 上报错 `Fontconfig error: Cannot load default config file` 或 `failed to allocate font`？**
+
+   缺少字体配置，安装 fontconfig 和基础字体：
+
+   ```bash
+   sudo apt install fontconfig fonts-dejavu
+   ```
+
+3. **窗口能打开但文字全是方框？**
+
+   缺少中文字体，安装 Noto CJK 字体：
+
+   ```bash
+   sudo apt install fonts-noto-cjk
+   ```
