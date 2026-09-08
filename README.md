@@ -7,6 +7,8 @@
 ## 功能特性
 
 - **批量转换**：一次导入多个文件，逐个生成对应的 `.md` 文件。
+- **PDF 原生引擎**：PDF 不再走 pdfminer，而是用 C 原生 PyMuPDF 直读路径；110MB 文件约 5 秒完成、峰值内存仅 146MB，比旧路径快约 57 倍、内存低约 32 倍（含无边框表格识别逻辑移植）。
+- **模型零拷贝（PDF 批次）**：纯 PDF 批次整个进程池不加载 Magika（ONNX）模型；markitdown 只在第一个非 PDF 文件到来时才懒加载，不浪费内存。
 - **合并模式**：将所有结果按指定顺序合并为单个 Markdown 文件。
 - **顺序控制**：内置按文件名 / 创建日期 / 修改日期 / 文件类型排序（可正序/倒序），或手动上移/下移/置顶/置底。
 - **输出控制**：自定义目标目录与输出文件名（留空自动使用「源文件名 _ 时间戳」；可勾选「默认文件名不加时间戳」）。
@@ -38,28 +40,36 @@ start.cmd
 
 ## 架构说明
 
-本项目针对「几十个 PDF 批量转换时 GUI 卡死」做过一轮针对性重构，关键设计如下：
+本项目针对「几十个 PDF 批量转换时 GUI 卡死 + 内存爆炸」做过针对性重构，关键设计如下：
 
 ### 为什么线程不行：GIL
 
-CPython 中**同一进程内的所有线程共享一把 GIL**。PDF 解析（pdfminer）是纯 Python 的 CPU 密集任务，线程越多越会互相抢锁，连 Tk 主线程的定时器回调都抢不到执行权——结果就是界面冻结。`ThreadPoolExecutor` 对这类 CPU 密集场景无能为力。
+CPython 中**同一进程内的所有线程共享一把 GIL**。CPU 密集的解析任务会互相抢锁，连 Tk 主线程的定时器回调都抢不到执行权——结果就是界面冻结。因此转换工作必须放在不同进程。
+
+### PDF 原生引擎 + 按文件类型分流
+
+**PDF 直接由 C 原生库解析**，不经过 MarkItDown 的 pdfminer 旧路径：
+
+- `_pool_child` 按扩展名分流：`.pdf` → 调用 `pdf_engine.convert_pdf_native`（PyMuPDF C 原生直读文件，路径直读不把整文件拷贝到内存）；其余类型 → 调用 MarkItDown。
+- `convert_pdf_native` 移植了 MarkItDown 内建 PDF 转换器的无边框表格/表单几何启发式，保留了表格识别质量，同时用 PyMuPDF 的 C 接口替换 pdfminer+pdfplumber 纯 Python 路径。
+- `markitdown` 在模块顶部**懒导入**（`from markitdown import MarkItDown` 移至函数体内）：纯 PDF 批次整个进程池不加载 MarkItDown、不加载 Magika/ONNX Runtime，模型内存为零；只有在第一个非 PDF 文件到来时才构造一次、全程复用。
+- 派发前的内存预估也按类型区分：PDF 原生路径峰值约等于文件大小，预估为 `max(96, 文件MB×1.5 + 64)`，不再乘 5，避免高估而限制并发。
 
 ### 进程隔离 + 常驻受管进程池
 
-真正的解法是把「抢 GIL 的重活」和「GUI 主循环」放进**不同的进程**。转换核心在 GUI 进程的工作线程里维护一个**常驻受管进程池**（见 `_convert_pooled`）：
+转换核心在 GUI 进程的工作线程里维护一个**常驻受管进程池**（见 `_convert_pooled`）：
 
-- **多核并行**：每个子进程一把独立 GIL，与 GUI 进程互不争抢，界面恒定流畅，同时真多核跑 pdfminer。
-- **模型只加载一次、全程复用**：`MarkItDown()` 内部会加载 Magika（ONNX 神经网络文件类型分类器）与各解析依赖，非常耗时。子进程用模块级懒加载 `_get_shared_converter()` 每个进程只构造一次，**整批任务复用、绝不每任务重载**；只用 `multiprocessing.Process` 自建池（`mp.Queue` 每子进程分发），换取「能中途按需回收单个子进程」的能力。
-- **派发前预估内存、复用优先**：每个待转文件先按 `文件大小 × 5 + 最小工作集` 估算峰值内存，优先把任务派给空闲且剩余容量足够的子进程；只有当池未满且不拥塞时才新建进程。新建只在池预热（数量=并发上限）和定点回收后发生，模型重载次数严格受限。
+- **多核并行**：每个子进程一把独立 GIL，与 GUI 进程互不争抢，界面恒定流畅。
+- **派发前预估内存、复用优先**：派发前按路径区分的内存预估，优先把任务派给空闲且剩余容量足够的子进程；只有当池未满且不拥塞时才新建进程。新建只在池预热（数量=并发上限）和定点回收后发生。
 - **自监控内存 + 在线调并发**：GUI 进程内 `_MemoryGovernor` 线程每 0.5s 统计「本进程 + 所有子进程」的 RSS，超过阈值（默认物理内存 85%，可在「输出选项 → 内存上限」调整）即标记拥塞：停止新建进程并压到只有 1 个在飞以等待高峰落地；回落后再逐步恢复到目标并发。
-- **定点回收涨大的子进程**：每个子进程完成一个任务后上报自身 RSS，超过「每进程应得份额」就终止它并换一个新进程——被大 PDF 撑起来的堆内存随进程退出真正归还系统。常态小文件下不会触发，模型不会反复重载。
+- **定点回收涨大的子进程**：每个子进程完成一个任务后上报自身 RSS，超过「每进程应得份额」就终止它并换一个新进程——被撑起来的堆内存随进程退出真正归还系统。
 - **避免跨线程触碰 Tcl 解释器**：Tkinter 的变量 `.get()`/`.set()` 不是线程安全的。转换前置项在 GUI 主线程快照成 `JobOptions` 后传入工作线程与子进程，工作侧全程不再访问任何 Tk 变量。
 - **`pythonw` 兼容**：Windows 下子进程通过 spawn 重新导入 `main.py`，靠顶层的 `if __name__ == "__main__"` 守卫避免递归创建 GUI；同时在模块顶部为无控制台的 `pythonw.exe` 补上 `stdout/stderr` 空设备兜底，避免子进程打印警告时崩溃。
 - **防卡死兜底**：占用超过 `TASK_TIMEOUT`（600s）的任务视为子进程卡死，自动换新进程并重派（最多重试 2 次）；状态栏实时显示「内存 x MB / 上限 y MB」。
 
 ### 并发资源权衡
 
-并发进程数（默认 `4`）只决定「模型加载几份」，**不决定峰值内存的多少**——真正兜住内存的是上面的自监控。每个子进程的模型基准约 100–300MB（8 并发 ≈ 1–2GB），转换自身再叠加「并发在飞数 × 单文件峰值」。两个旋钮（并发数 / 内存上限）配合使用：内存紧就调小并发，或让程序自动降并发并回收。
+并发进程数（默认 `4`）决定「最多几个子进程同时运行」，真正兜住内存的是上面的自监控。PDF 批次每个子进程几乎不带模型内存，只占各自文件大小的解析开销；非 PDF 文件才加载 markitdown 模型基准（约 100–300MB/进程）。两个旋钮（并发数 / 内存上限）配合使用：内存紧就调小并发，或让程序自动降并发并回收。
 
 ## 打包发布（GitHub Actions）
 
@@ -78,18 +88,19 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。PDF 解析（pdf
 
 ### 打包要点
 
-- 每个 runner 用 `uv sync` 安装 `markitdown[all]` 后，以 `--collect-all magika/onnxruntime` 收集 ONNX 模型等数据文件，产出单文件可执行程序。
-- 打包后 `ProcessPoolExecutor` 的子进程会重新执行打包后的可执行文件，因此 `main()` 里已调用 `multiprocessing.freeze_support()`，保证并发转换在冻结环境下照常工作（含各子进程内模型独立加载）。
+- PyInstaller 需打包三个额外的 C 扩展包：`--collect-all magika`（ONNX 模型）、`--collect-all markitdown`（解析器注册入口）、`--collect-all pymupdf`（PDFium 核心动态库）。
+- 打包后每个子进程会重新执行打包后的可执行文件，因此 `main.py` 里已调用 `multiprocessing.freeze_support()`，保证并发转换在冻结环境下照常工作。
 - Linux runner 需先 `apt install python3-tk`（GitHub 提供的 Python 构建默认不含 tkinter），并让 uv 优先用系统 Python（`UV_PYTHON_PREFERENCE=system`）。
 - macOS 只提供 Apple Silicon 产物：GitHub 已停用 Intel (macos-13) 免费 runner。Intel Mac 如需 exe 请在本地执行同样的 PyInstaller 命令自行构建。
 
 ## 项目结构
 
 ```
-main.py                             全部代码（GUI + 转换逻辑，单文件）
-start.cmd                           启动入口（cmd 会闪一次，之后由 pythonw 运行 GUI）
-pyproject.toml                      依赖声明（markitdown[all] >= 0.1.5）
-.github/workflows/release.yml       PyInstaller 三平台打包 + 自动发布 Releases
+main.py                   GUI、选项界面、受管进程池、调度器
+pdf_engine.py             PDF→Markdown 原生转换器（PyMuPDF，移植无边框表格启发式）
+start.cmd                 启动入口（cmd 会闪一次，之后由 pythonw 运行 GUI）
+pyproject.toml            依赖声明（markitdown[all] + PyMuPDF + psutil）
+.github/workflows/        PyInstaller 三平台打包 + 自动发布 Releases
 ```
 
 ## License

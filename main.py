@@ -16,17 +16,21 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import psutil
-from markitdown import MarkItDown
+
+from pdf_engine import convert_pdf_native
 
 if sys.stdout is None or sys.stderr is None:
     sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
-_shared_converter: MarkItDown | None = None
+_shared_converter: object | None = None
 
 
-def _get_shared_converter() -> MarkItDown:
+def _get_shared_converter():
+    """懒加载 MarkItDown：纯 PDF 批次整个进程池不加载 magika 模型/onnxruntime。"""
     global _shared_converter
     if _shared_converter is None:
+        from markitdown import MarkItDown
+
         _shared_converter = MarkItDown()
     return _shared_converter
 
@@ -44,15 +48,25 @@ def _process_rss() -> int:
 
 
 def _pool_child(task_q: mp.Queue, result_q: mp.Queue) -> None:
-    converter = _get_shared_converter()
+    converter = None  # markitdown 懒加载；纯 PDF 批次永不构造 -> magika 模型 0 份
     while True:
         task = task_q.get()
         if task is None:
             break
         index, source = task
         try:
-            result = converter.convert(source)
-            markdown = result.markdown or result.text_content or ""
+            if source.suffix.lower() == ".pdf":
+                markdown = convert_pdf_native(source)
+                if not markdown:
+                    if converter is None:
+                        converter = _get_shared_converter()
+                    result = converter.convert(source)
+                    markdown = result.markdown or result.text_content or ""
+            else:
+                if converter is None:
+                    converter = _get_shared_converter()
+                result = converter.convert(source)
+                markdown = result.markdown or result.text_content or ""
             result_q.put((os.getpid(), index, source, True, markdown, None, _process_rss()))
         except Exception as exc:  # noqa: BLE001
             result_q.put((os.getpid(), index, source, False, "", repr(exc), _process_rss()))
@@ -1243,6 +1257,9 @@ class MarkItDownApp(tk.Tk):
                 size_mb = source.stat().st_size / (1024 * 1024)
             except OSError:
                 return 0
+            if source.suffix.lower() == ".pdf":
+                # 原生 PyMuPDF 路径：峰值约等于文件大小 + 固定基线，不再放大
+                return max(96, round(size_mb * 1.5) + 64)
             return max(64, round(size_mb * AMPLIFY_FACTOR))
 
         def best_idle_child(est_mb: int) -> int | None:
