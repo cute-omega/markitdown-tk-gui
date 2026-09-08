@@ -1497,7 +1497,7 @@ class MarkItDownApp(tk.Tk):
 
 
 def main() -> None:
-    multiprocessing.freeze_support()
+    mp.freeze_support()
     app = MarkItDownApp()
     app.mainloop()
 

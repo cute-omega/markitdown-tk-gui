@@ -121,3 +121,22 @@ pyproject.toml            依赖声明（markitdown[all] + pymupdf + psutil）
 GPL-3.0 License (see [LICENSE](LICENSE) for details)。
 
 本项目依赖 PyMuPDF（AGPL-3.0）；组合后整体分发需遵循 AGPL 义务（本仓库已公开，源码可获取，合规无额外操作）。
+
+## FAQ（常见问题）
+
+1. **为什么在 WSL2 的 Debian 上报错 `ImportError: libxcb.so.1: cannot open shared object file: No such file or directory`？**
+
+    这是因为 Tkinter 依赖的 X11 库在 WSL2 中缺失。解决方法：
+
+    ```bash
+    sudo apt update && sudo apt install libxcb1
+    ```
+
+    不推荐的做法：
+
+    ```bash
+    sudo apt update
+    sudo apt install libxcb-xinerama0 libx11-6 libxext6 libxrender1 libxrandr2
+   ```
+
+   安装后重启 WSL2，再运行 GUI 即可。
