@@ -47,6 +47,7 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
 
       - name: Install tkinter for Linux
         if: runner.os == 'Linux'
