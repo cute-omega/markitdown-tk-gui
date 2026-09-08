@@ -19,8 +19,25 @@ env:
   APP_NAME: markitdown-tk-gui
 
 jobs:
+  determine-version:
+    name: Determine version tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Package ${{ matrix.target }}
+    needs: determine-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -28,13 +45,13 @@ jobs:
         include:
           - os: windows-latest
             target: windows-x86_64
-            asset_name: markitdown-tk-gui-windows-x86_64.exe
+            ext: .exe
           - os: ubuntu-24.04
             target: linux-x86_64
-            asset_name: markitdown-tk-gui-linux-x86_64
+            ext: ""
           - os: macos-14
             target: macos-arm64
-            asset_name: markitdown-tk-gui-macos-arm64.zip
+            ext: ""
 
     env:
       UV_PYTHON_PREFERENCE: system
@@ -63,7 +80,7 @@ jobs:
         run: |
           uv run --with pyinstaller pyinstaller \
             --noconfirm --clean --onefile --windowed \
-            --name ${{ env.APP_NAME }} \
+            --name "${{ env.APP_NAME }}-${{ needs.determine-version.outputs.version }}-${{ matrix.target }}" \
             --collect-all magika \
             --collect-all markitdown \
             --collect-all onnxruntime \
@@ -72,42 +89,35 @@ jobs:
 
       - name: Package macOS .app bundle
         if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/${{ env.APP_NAME }}.app" "${{ matrix.asset_name }}"
+        run: |
+          ASSET_NAME="${{ env.APP_NAME }}-${{ needs.determine-version.outputs.version }}-${{ matrix.target }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/${{ env.APP_NAME }}-${{ needs.determine-version.outputs.version }}-${{ matrix.target }}.app" "${ASSET_NAME}"
 
       - name: Upload artifact (macOS .app zipped)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}
+          name: ${{ env.APP_NAME }}-${{ needs.determine-version.outputs.version }}-${{ matrix.target }}.zip
+          path: ${{ env.APP_NAME }}-${{ needs.determine-version.outputs.version }}-${{ matrix.target }}.zip
           if-no-files-found: error
 
       - name: Upload artifact (Windows/Linux single file)
         if: runner.os != 'macOS'
         uses: actions/upload-artifact@v5
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/${{ env.APP_NAME }}${{ runner.os == 'Windows' && '.exe' || '' }}
+          name: ${{ env.APP_NAME }}-${{ needs.determine-version.outputs.version }}-${{ matrix.target }}${{ matrix.ext }}
+          path: dist/${{ env.APP_NAME }}-${{ needs.determine-version.outputs.version }}-${{ matrix.target }}${{ matrix.ext }}
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [determine-version, build]
     runs-on: ubuntu-latest
     if: |
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
 
     steps:
-      - name: Determine release tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
@@ -125,8 +135,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.tag.outputs.tag }}" \
+          gh release create "${{ needs.determine-version.outputs.version }}" \
             ./* \
-            --title "markitdown-tk-gui ${{ steps.tag.outputs.tag }}" \
+            --title "markitdown-tk-gui ${{ needs.determine-version.outputs.version }}" \
             --generate-notes \
             --repo "${{ github.repository }}"
