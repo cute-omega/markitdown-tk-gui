@@ -34,7 +34,7 @@ jobs:
             asset_name: markitdown-tk-gui-linux-x86_64
           - os: macos-14
             target: macos-arm64
-            asset_name: markitdown-tk-gui-macos-arm64
+            asset_name: markitdown-tk-gui-macos-arm64.zip
 
     env:
       UV_PYTHON_PREFERENCE: system
@@ -71,12 +71,16 @@ jobs:
             --collect-all pymupdf \
             main.py
 
-      - name: Upload artifact (macOS .app bundle needs zip)
+      - name: Package macOS .app bundle
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/${{ env.APP_NAME }}.app" "${{ matrix.asset_name }}"
+
+      - name: Upload artifact (macOS .app zipped)
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: dist/${{ env.APP_NAME }}.app
+          path: ${{ matrix.asset_name }}
           if-no-files-found: error
 
       - name: Upload artifact (Windows/Linux single file)
@@ -113,7 +117,9 @@ jobs:
 
       - name: Generate checksums
         working-directory: artifacts
-        run: sha256sum ./* > SHA256SUMS
+        run: |
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Create or update release
         working-directory: artifacts
