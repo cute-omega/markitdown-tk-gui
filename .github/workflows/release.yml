@@ -25,6 +25,9 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
       - name: Determine version
         id: version
         run: |
@@ -32,6 +35,9 @@ jobs:
             TAG="${{ github.event.inputs.release_tag }}"
           else
             TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          if [ -z "$TAG" ]; then
+            TAG=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           fi
           echo "version=${TAG}" >> "$GITHUB_OUTPUT"
 
