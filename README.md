@@ -4,6 +4,8 @@
 
 支持一次选择几十个任意类型文件（PDF、DOCX、XLSX、PPTX、图片、网页等）批量转换为 Markdown；提供合并输出、自定义排序、深色模式、实时预览与日志面板。
 
+> **本项目最特别的地方**：它是为「一次性批量转换几十个超大 PDF（单文件可达 800MB 以上）且 GUI 不卡、内存不爆」而设计的。为此做了两层针对性改造——**PDF 走 C 原生 PyMuPDF 引擎**（省去 pdfminer 的逐字节纯 Python 解析，见下文基准），以及**常驻受管进程池 + 运行时内存自监控**（并发转换、超限自动降并发并回收进程）。
+
 ## 功能特性
 
 - **批量转换**：一次导入多个文件，逐个生成对应的 `.md` 文件。
@@ -71,6 +73,17 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。CPU 密集的解
 
 并发进程数（默认 `4`）决定「最多几个子进程同时运行」，真正兜住内存的是上面的自监控。PDF 批次每个子进程几乎不带模型内存，只占各自文件大小的解析开销；非 PDF 文件才加载 markitdown 模型基准（约 100–300MB/进程）。两个旋钮（并发数 / 内存上限）配合使用：内存紧就调小并发，或让程序自动降并发并回收。
 
+## 性能基准
+
+用同一份 110MB 的真实 PDF 在单核下对比原生引擎与 markitdown 旧路径（pdfminer+pdfplumber）：
+
+| 引擎 | 耗时 | 峰值内存 |
+|------|------|----------|
+| markitdown 0.1.5（pdfminer/pdfplumber） | 272 秒 | 4.7 GB |
+| **本项目的 PyMuPDF 原生引擎** | **约 5 秒** | **146 MB** |
+
+约 **57 倍更快、32 倍更省内存**。838MB 的 PDF 用原生引擎约 34 秒、峰值 ~680MB。配合下方「常驻受管进程池 + 内存自监控」，几十个超大 PDF 可安全并发批量转换。
+
 ## 打包发布（GitHub Actions）
 
 仓库内置 `.github/workflows/release.yml`，用 PyInstaller 在三种系统各自产出**便携版可执行文件**并自动发布到 GitHub Releases：
@@ -97,9 +110,9 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。CPU 密集的解
 
 ```
 main.py                   GUI、选项界面、受管进程池、调度器
-pdf_engine.py             PDF→Markdown 原生转换器（PyMuPDF，移植无边框表格启发式）
+pdf_engine.py             PDF→Markdown 原生转换器（PyMuPDF C 引擎，移植无边框表格启发式）
 start.cmd                 启动入口（cmd 会闪一次，之后由 pythonw 运行 GUI）
-pyproject.toml            依赖声明（markitdown[all] + PyMuPDF + psutil）
+pyproject.toml            依赖声明（markitdown[all] + pymupdf + psutil）
 .github/workflows/        PyInstaller 三平台打包 + 自动发布 Releases
 ```
 
