@@ -124,6 +124,19 @@ jobs:
       (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Verify version consistency
+        run: |
+          TAG_VERSION="${{ needs.determine-version.outputs.version }}"
+          PYPROJECT_VERSION=$(grep '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::版本不一致！tag=$TAG_VERSION, pyproject.toml=$PYPROJECT_VERSION"
+            exit 1
+          fi
+          echo "版本校验通过: $TAG_VERSION"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
