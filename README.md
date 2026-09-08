@@ -51,7 +51,7 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。CPU 密集的解
 **PDF 直接由 C 原生库解析**，不经过 MarkItDown 的 pdfminer 旧路径：
 
 - `_pool_child` 按扩展名分流：`.pdf` → 调用 `pdf_engine.convert_pdf_native`（PyMuPDF C 原生直读文件，路径直读不把整文件拷贝到内存）；其余类型 → 调用 MarkItDown。
-- `convert_pdf_native` 移植了 MarkItDown 内建 PDF 转换器的无边框表格/表单几何启发式，保留了表格识别质量，同时用 PyMuPDF 的 C 接口替换 pdfminer+pdfplumber 纯 Python 路径。
+- `convert_pdf_native` 移植了 MarkItDown 内建 PDF 转换器的无边框表格/表单几何启发式，保留了表格识别质量，同时用 PyMuPDF 的 C 接口替换 pdfminer+pdfplumber 纯 Python 路径。**失败回退**：若原生引擎抛异常或返回空白，自动回退到 MarkItDown 内置引擎重试一次（仅首次触发构造，不额外常驻模型）。
 - `markitdown` 在模块顶部**懒导入**（`from markitdown import MarkItDown` 移至函数体内）：纯 PDF 批次整个进程池不加载 MarkItDown、不加载 Magika/ONNX Runtime，模型内存为零；只有在第一个非 PDF 文件到来时才构造一次、全程复用。
 - 派发前的内存预估也按类型区分：PDF 原生路径峰值约等于文件大小，预估为 `max(96, 文件MB×1.5 + 64)`，不再乘 5，避免高估而限制并发。
 
@@ -105,4 +105,6 @@ pyproject.toml            依赖声明（markitdown[all] + PyMuPDF + psutil）
 
 ## License
 
-GPL-3.0 License (see [LICENSE](LICENSE) for details)
+GPL-3.0 License (see [LICENSE](LICENSE) for details)。
+
+本项目依赖 PyMuPDF（AGPL-3.0）；组合后整体分发需遵循 AGPL 义务（本仓库已公开，源码可获取，合规无额外操作）。

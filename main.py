@@ -56,8 +56,12 @@ def _pool_child(task_q: mp.Queue, result_q: mp.Queue) -> None:
         index, source = task
         try:
             if source.suffix.lower() == ".pdf":
-                markdown = convert_pdf_native(source)
+                try:
+                    markdown = convert_pdf_native(source)
+                except Exception:
+                    markdown = ""
                 if not markdown:
+                    # 原生引擎失败或空白 → 回退到 markitdown 内置引擎（仅首次触发构造一次）
                     if converter is None:
                         converter = _get_shared_converter()
                     result = converter.convert(source)
