@@ -126,20 +126,13 @@ GPL-3.0 License (see [LICENSE](LICENSE) for details)。
 
 1. **为什么在 WSL2 的 Debian 上报错 `ImportError: libxcb.so.1: cannot open shared object file: No such file or directory`？**
 
-    这是因为 Tkinter 依赖的 X11 库在 WSL2 中缺失。解决方法：
+    这是因为 Tkinter 依赖的库在 WSL2 中缺失。解决方法：
 
     ```bash
     sudo apt update && sudo apt install libxcb1
     ```
 
-    不推荐的做法：
-
-    ```bash
-    sudo apt update
-    sudo apt install libxcb-xinerama0 libx11-6 libxext6 libxrender1 libxrandr2
-   ```
-
-   安装后重启 WSL2，再运行 GUI 即可。
+   安装后再运行 GUI 即可。
 
 2. **WSL2 上报错 `Fontconfig error: Cannot load default config file` 或 `failed to allocate font`？**
 
