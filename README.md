@@ -77,9 +77,9 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。CPU 密集的解
 
 | 平台 | 产物 |
 |------|------|
-| Windows x64 | `markitdown-tk-gui-windows-x86_64.zip`（内含单个 `.exe`） |
-| Linux x64 | `markitdown-tk-gui-linux-x86_64.tar.gz` |
-| macOS（Apple Silicon） | `markitdown-tk-gui-macos-arm64.tar.gz`（内含 `.app`） |
+| Windows x64 | `markitdown-tk-gui-windows-x86_64.exe`（单文件可执行） |
+| Linux x64 | `markitdown-tk-gui-linux-x86_64`（单文件可执行） |
+| macOS（Apple Silicon） | `markitdown-tk-gui-macos-arm64.app`（.app 目录包） |
 
 ### 触发方式
 
@@ -88,7 +88,7 @@ CPython 中**同一进程内的所有线程共享一把 GIL**。CPU 密集的解
 
 ### 打包要点
 
-- PyInstaller 需打包三个额外的 C 扩展包：`--collect-all magika`（ONNX 模型）、`--collect-all markitdown`（解析器注册入口）、`--collect-all pymupdf`（PDFium 核心动态库）。
+- PyInstaller 需打包四个额外的 C 扩展包：`--collect-all magika`（ONNX 模型）、`--collect-all markitdown`（解析器注册入口）、`--collect-all onnxruntime`（运行时）、`--collect-all pymupdf`（PDFium 核心动态库）。
 - 打包后每个子进程会重新执行打包后的可执行文件，因此 `main.py` 里已调用 `multiprocessing.freeze_support()`，保证并发转换在冻结环境下照常工作。
 - Linux runner 需先 `apt install python3-tk`（GitHub 提供的 Python 构建默认不含 tkinter），并让 uv 优先用系统 Python（`UV_PYTHON_PREFERENCE=system`）。
 - macOS 只提供 Apple Silicon 产物：GitHub 已停用 Intel (macos-13) 免费 runner。Intel Mac 如需 exe 请在本地执行同样的 PyInstaller 命令自行构建。
